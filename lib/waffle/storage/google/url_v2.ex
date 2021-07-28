@@ -79,7 +79,7 @@ defmodule Waffle.Storage.Google.UrlV2 do
 
   @spec build_signed_url(Types.definition, String.t, Keyword.t) :: String.t
   defp build_signed_url(definition, path, options) do
-    {:ok, client_id} = Goth.Config.get(:client_email)
+    {:ok, client_email} = find_client_email()
 
     expiration = System.os_time(:second) + expiry(options)
 
@@ -90,7 +90,7 @@ defmodule Waffle.Storage.Google.UrlV2 do
 
     base_url = build_url(definition, path)
 
-    "#{base_url}?GoogleAccessId=#{client_id}&Expires=#{expiration}&Signature=#{signature}"
+    "#{base_url}?GoogleAccessId=#{client_email}&Expires=#{expiration}&Signature=#{signature}"
   end
 
   @spec build_path(Types.definition, String.t) :: String.t
@@ -120,7 +120,15 @@ defmodule Waffle.Storage.Google.UrlV2 do
 
   @spec sign_request(String.t) :: String.t
   defp sign_request(request) do
-    {:ok, pem_bin} = Goth.Config.get("private_key")
+    case Goth.Config.get("private_key") do
+      {:ok, pem_bin} ->
+        sign_request_with_private_key(request, pem_bin)
+      :error ->
+        sign_request_with_api_call(request)
+    end
+  end
+
+  defp sign_request_with_private_key(request, pem_bin) do
     [pem_key_data] = :public_key.pem_decode(pem_bin)
     otp_release = System.otp_release() |> String.to_integer()
 
@@ -138,5 +146,35 @@ defmodule Waffle.Storage.Google.UrlV2 do
     |> :public_key.sign(:sha256, rsa_key)
     |> Base.encode64()
     |> URI.encode_www_form()
+  end
+
+  defp sign_request_with_api_call(request) do
+    {:ok, client_email} = find_client_email()
+    {:ok, token} = Goth.Token.for_scope("https://www.googleapis.com/auth/iam,https://www.googleapis.com/auth/cloud-platform")
+    headers = [{"Authorization", "#{token.type} #{token.token}"}, {"content-type", "application/json"}]
+
+    url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/#{client_email}:signBlob"
+    {:ok, %{status_code: 200, body: resp_json}} = HTTPoison.post(url, Jason.encode!(%{payload: Base.url_encode64(request)}), headers)
+
+    resp_json
+    |> Jason.decode!()
+    |> Map.get("signedBlob")
+    |> URI.encode_www_form()
+  end
+
+  defp find_client_email() do
+    case Goth.Config.get(:client_email) do
+      {:ok, client_email} -> {:ok, client_email}
+
+      :error ->
+        headers = [{"Metadata-Flavor", "Google"}]
+        url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"   
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+        {:ok, %{body: client_email, status_code: 200}} = HTTPoison.get(url, headers)                                                         
+
+        Goth.Config.set(:client_email, client_email)
+
+        {:ok, client_email}
+    end
   end
 end
